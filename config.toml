@@ -1,0 +1,9 @@
+# Path to CSV with patient IDs
+path_to_csv='./data/test.csv'
+# If true, will write to logfile to log-dir
+log-to-file=false
+# Directory where logs should be written. Will be created if doesn't exist.
+# Ignored if log-to-file is false
+log-dir='./logs/' 
+# Detail to print when logging. Should be DEBUG in dev.
+log-level="INFO"
