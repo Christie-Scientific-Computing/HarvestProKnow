@@ -133,7 +133,7 @@ def test_filter_doses_keeps_only_plan_summation_type(monkeypatch):
         id="p", mrn="MRN1", name="N", birth_date="2000-01-01", sex="M", data={},
         entities=[plan_dose, beam_dose],
     )
-    ask = make_ask(patient=patient)
+    ask = make_ask(patient=patient, _dose_dataset_cache={})
 
     def fake_dcmread(path):
         ds = pydicom.Dataset()
@@ -143,6 +143,10 @@ def test_filter_doses_keeps_only_plan_summation_type(monkeypatch):
     monkeypatch.setattr(pk_module.pydicom, "dcmread", fake_dcmread)
 
     assert ask._filter_doses() == ["d-plan"]
+    # Only the accepted dose's parsed Dataset is cached for reuse by
+    # get_dose_metrics()/calculate_dvhs() -- the rejected BEAM dose isn't.
+    assert list(ask._dose_dataset_cache.keys()) == ["d-plan"]
+    assert ask._dose_dataset_cache["d-plan"].DoseSummationType == "PLAN"
 
 
 # --------------------------------------------------------------------------
@@ -309,10 +313,10 @@ def test_calculate_dvhs_drops_zero_volume_structures(monkeypatch):
     ask = make_ask()
 
     fake_ds_struct = object()
-    fake_ds_dose = object()
+    fake_ds_dose = object()  # already-parsed by _filter_doses; not re-read from disk here.
 
     def fake_dcmread(path):
-        return {"structpath": fake_ds_struct, "dosepath": fake_ds_dose}[path]
+        return {"structpath": fake_ds_struct}[path]
 
     class FakeDicomParser:
         def __init__(self, dataset):
@@ -332,7 +336,7 @@ def test_calculate_dvhs_drops_zero_volume_structures(monkeypatch):
     monkeypatch.setattr(pk_module.dicomparser, "DicomParser", FakeDicomParser)
     monkeypatch.setattr(pk_module.dvhcalc, "get_dvh", fake_get_dvh)
 
-    result = ask.calculate_dvhs("dose-1", "structpath", "dosepath")
+    result = ask.calculate_dvhs("dose-1", "structpath", fake_ds_dose)
 
     assert len(result) == 1
     assert result[0] == {
@@ -389,7 +393,6 @@ def test_calculate_geometrical_metrics_orchestration(monkeypatch):
 def test_get_dose_metrics_orchestrates_dvh_and_geometry_per_accepted_dose(monkeypatch):
     dose_entity = FakeEntity(
         {"id": "d1", "type": "dose", "structure_set_id": "ss1", "image_set_id": "img1"},
-        download_path="/tmp/d1-dose.dcm",
     )
     ss_entity = FakeEntity({"id": "ss1", "type": "structure_set"}, download_path="/tmp/ss1-struct.dcm")
     img_entity = FakeEntity({"id": "img1", "type": "image_set"})
@@ -397,12 +400,13 @@ def test_get_dose_metrics_orchestrates_dvh_and_geometry_per_accepted_dose(monkey
         id="p", mrn="MRN1", name="N", birth_date="2000-01-01", sex="M", data={},
         entities=[dose_entity, ss_entity, img_entity],
     )
-    ask = make_ask(patient=patient, accepted_dose_ids=["d1"])
+    fake_ds_dose = object()  # already parsed by _filter_doses; get_dose_metrics shouldn't re-download it.
+    ask = make_ask(patient=patient, accepted_dose_ids=["d1"], _dose_dataset_cache={"d1": fake_ds_dose})
 
     monkeypatch.setattr(ask, "_download_image_slices", lambda image_set, tmpdir, indices: [])
     monkeypatch.setattr(
         ask, "calculate_dvhs",
-        lambda dose_id, structpath, dosepath: [{"dose_id": dose_id, "structure_name": "PTV"}],
+        lambda dose_id, structpath, ds_dose: [{"dose_id": dose_id, "structure_name": "PTV"}],
     )
     monkeypatch.setattr(
         ask, "calculate_geometrical_metrics",
@@ -422,7 +426,6 @@ def test_get_dose_metrics_orchestrates_dvh_and_geometry_per_accepted_dose(monkey
 def test_get_dose_metrics_skips_doses_not_in_accepted_dose_ids(monkeypatch):
     accepted = FakeEntity(
         {"id": "d1", "type": "dose", "structure_set_id": "ss1", "image_set_id": "img1"},
-        download_path="/tmp/d1-dose.dcm",
     )
     rejected = FakeEntity(
         {"id": "d2", "type": "dose", "structure_set_id": "ss2", "image_set_id": "img2"},
@@ -433,14 +436,15 @@ def test_get_dose_metrics_skips_doses_not_in_accepted_dose_ids(monkeypatch):
         id="p", mrn="MRN1", name="N", birth_date="2000-01-01", sex="M", data={},
         entities=[accepted, rejected, ss_entity, img_entity],
     )
-    # d2 is excluded, e.g. because _filter_doses found its DoseSummationType == "BEAM".
-    ask = make_ask(patient=patient, accepted_dose_ids=["d1"])
+    # d2 is excluded, e.g. because _filter_doses found its DoseSummationType == "BEAM"
+    # (and so was never added to _dose_dataset_cache either).
+    ask = make_ask(patient=patient, accepted_dose_ids=["d1"], _dose_dataset_cache={"d1": object()})
 
     calls = []
     monkeypatch.setattr(ask, "_download_image_slices", lambda image_set, tmpdir, indices: [])
     monkeypatch.setattr(
         ask, "calculate_dvhs",
-        lambda dose_id, structpath, dosepath: calls.append(dose_id) or [],
+        lambda dose_id, structpath, ds_dose: calls.append(dose_id) or [],
     )
     monkeypatch.setattr(
         ask, "calculate_geometrical_metrics",

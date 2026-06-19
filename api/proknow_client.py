@@ -36,20 +36,24 @@ class AskProKnow():
         # Calc patient hash to check if known 
         self.patient_hash = self._calc_patient_hash(self.patient.data)
 
-        # Downloads RTDOSEs for this patient and extracts the DoseSummationType tag. 
-        # Where type == BEAM, doses are dropped.
+        # Downloads RTDOSEs for this patient and extracts the DoseSummationType tag.
+        # Where type == BEAM, doses are dropped. The parsed Dataset for each
+        # accepted dose is cached here so get_dose_metrics() can reuse it
+        # instead of downloading/parsing the same RTDOSE again.
+        self._dose_dataset_cache: dict[str, pydicom.Dataset] = {}
         self.accepted_dose_ids = self._filter_doses()
-    
-    def _filter_doses(self):
+
+    def _filter_doses(self) -> list[str]:
         accepted_ids = []
         doses = self.patient.find_entities(lambda entity: entity.data['type'] == 'dose')
         for dose_ in doses:
-            dose = dose_.get() 
+            dose = dose_.get()
             with tempfile.TemporaryDirectory() as tmpdir:
                 dosepath = dose.download(tmpdir)
                 ds = pydicom.dcmread(dosepath)
-                if ds.DoseSummationType == "PLAN":
-                    accepted_ids.append(dose.data['id'])
+            if ds.DoseSummationType == "PLAN":
+                accepted_ids.append(dose.data['id'])
+                self._dose_dataset_cache[dose.data['id']] = ds
 
         return accepted_ids
 
@@ -180,27 +184,27 @@ class AskProKnow():
     def get_dose_metrics(self) -> tuple[list[dict], list[dict]]:
         """
         Computes DVH data and geometrical metrics for every accepted dose.
-        Each dose's RTDOSE, RTSTRUCT, and a slice subset of its image set are
-        downloaded once and shared between the two calculations (previously
-        fetched/downloaded independently by each).
+        Each dose's RTDOSE was already downloaded and parsed by
+        _filter_doses() (cached in self._dose_dataset_cache); its RTSTRUCT
+        and a slice subset of its image set are downloaded once here and
+        shared between the two calculations (previously fetched/downloaded
+        independently by each).
         """
         doses = self.patient.find_entities(lambda entity: entity.data['type'] == 'dose')
 
         dvh_data = []
         geom_metrics = []
         for dose in doses:
-            if dose.data['id'] not in self.accepted_dose_ids:
-                continue
             dose_id = dose.data['id']
+            if dose_id not in self.accepted_dose_ids:
+                continue
             structure_set_id = dose.data['structure_set_id']
             image_set_id = dose.data['image_set_id']
 
-            dose_item = self.patient.find_entities(lambda entity: entity.data['id'] == dose_id)[0].get()
             structure_set = self.patient.find_entities(lambda entity: entity.data['id'] == structure_set_id)[0].get()
             image_set = self.patient.find_entities(lambda entity: entity.data['id'] == image_set_id)[0].get()
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                dosepath = dose_item.download(tmpdir)
                 structpath = structure_set.download(tmpdir)
                 image_dir = os.path.join(tmpdir, "image")
                 os.makedirs(image_dir)
@@ -208,7 +212,7 @@ class AskProKnow():
                 # validation and true slice spacing, not the whole series.
                 self._download_image_slices(image_set, image_dir, indices=[0, 1])
 
-                dvh_data.extend(self.calculate_dvhs(dose_id, structpath, dosepath))
+                dvh_data.extend(self.calculate_dvhs(dose_id, structpath, self._dose_dataset_cache[dose_id]))
 
                 metrics = self.calculate_geometrical_metrics(structure_set_id, image_set_id, structpath, image_dir)
                 for metric_ in metrics['pairwise_metrics']:
@@ -240,16 +244,17 @@ class AskProKnow():
             paths.append(path)
         return paths
 
-    def calculate_dvhs(self, dose_id: str, structpath: str, dosepath: str) -> list[dict]:
+    def calculate_dvhs(self, dose_id: str, structpath: str, ds_dose: pydicom.Dataset) -> list[dict]:
         """
         Method to get DVHs for each structure in a consistent format.
-        Expects already-downloaded RTSTRUCT/RTDOSE file paths for the dose.
+        Expects an already-downloaded RTSTRUCT path, and the dose's already-
+        parsed RTDOSE Dataset (cached by _filter_doses, since it already
+        downloaded and parsed it once to read DoseSummationType).
         """
         # Parsed once and reused across structures: dvhcalc.get_dvh() re-reads
         # its structure/dose arguments from disk on every call if given file
         # paths, but accepts pre-parsed pydicom Datasets instead.
         ds_struct = pydicom.dcmread(structpath)
-        ds_dose = pydicom.dcmread(dosepath)
         struct = dicomparser.DicomParser(ds_struct)
         structures = struct.GetStructures()
 
