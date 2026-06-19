@@ -69,7 +69,7 @@ class AskProKnow():
         with open(f'./tmp/{filename}.json', 'w') as f:
             json.dump(data, f, indent=4)
 
-    def find_patient(self, patient_id: str) -> Patients.PatientItem:
+    def find_patient(self, patient_id: str) -> PatientItem:
         """Gets respective PatientItem for a given patient"""
         #patients = self.pk.patients.lookup(self.workspace, [patient_id])
         patients = self.pk.patients.query(self.workspace, search=patient_id)
