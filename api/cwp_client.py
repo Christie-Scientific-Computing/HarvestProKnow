@@ -71,6 +71,7 @@ class AskCWP():
             "primary_site": raw['PrimaryTreatmentSite'],
             "metastatic_site": raw['MetastaticSite'],
             "regional_node_site": raw['RegionalNodalSite'],
+            "side_of_primary_treatment_site": raw['SideOfPrimaryTreatmentSite'],
             "side_of_nodal_treatment": raw['SideOfNodalTreatmentSite'],
             "treatment_by": raw['TreatmentBy'],
             "treatment_category": raw['TreatmentCategory'],
