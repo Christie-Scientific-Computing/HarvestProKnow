@@ -20,7 +20,7 @@ Requires:
 - [config.toml](config.toml) in the repo root for non-secret runtime config: `path_to_csv` (CSV of patient IDs, column `patient_id`), `log-to-file`, `log-dir`, `log-level`.
 - A running PostgreSQL instance with the expected tables already created (`patients`, `doses`, `dvh_data`, `geom_metrics` — see Database section below). Table creation/migrations are not part of this repo.
 
-There is no test suite, linter config, or CI pipeline in this repo currently.
+A pytest-based unit test suite exists under [tests/](tests/) (run with `python -m pytest tests/`); see [tests/README.md](tests/README.md) for the mocking strategy. There is no linter config or CI pipeline file in this repo currently.
 
 ### Docker
 
@@ -31,16 +31,18 @@ There is no test suite, linter config, or CI pipeline in this repo currently.
 **[harvest.py](harvest.py)** — entry point and orchestration (`ProknowHarvester`).
 - `ProknowHarvester` is a context manager wrapping a single `psycopg` connection (`__enter__`/`__exit__` open/close it).
 - `run(csv_path)` loops over patient IDs read from CSV, calling `fetch_proknow_data` then `write_results_to_db` per patient (no batching).
-- `fetch_proknow_data` constructs an `AskProKnow(patient_id)`, skips the patient if not found in Proknow, and gathers four result buckets: `patient_data`, `treatment_data`, `dvh_data`, `geom_metrics`. New data types should be added as a new key in this dict plus a matching `AskProKnow` getter.
+- `fetch_proknow_data` constructs an `AskProKnow(patient_id)`, skips the patient if not found in Proknow, and gathers four result buckets: `patient_data`, `treatment_data`, `dvh_data`, `geom_metrics` (the latter two both come from one `AskProKnow.get_dose_metrics()` call). New data types should be added as a new key in this dict plus a matching `AskProKnow` getter.
 - A hash-skip mechanism (`check_hash_in_db`) is meant to avoid re-fetching unchanged patients (SHA-256 over the raw Proknow patient summary JSON), but the actual `return` on hash-match is currently commented out — every patient is refetched and upserted regardless.
 - `write_results_to_db` / `_write_table` perform generic `INSERT ... ON CONFLICT (id_col) DO UPDATE` upserts, driven entirely by dict keys in the result payloads — so the table schema is implicitly defined by whatever keys `AskProKnow.get_*` methods return. `id_col` can be a single column or a tuple of columns (composite conflict target).
 
 **[api/proknow_client.py](api/proknow_client.py)** — `AskProKnow`, the Proknow data-access layer. One instance per patient.
-- On construction, looks up the patient by ID (`find_patient`), downloads the full `PatientItem`, and computes `patient_hash` over `patient.data`.
+- On construction, looks up the patient by ID (`find_patient`), downloads the full `PatientItem`, computes `patient_hash` over `patient.data`, then calls `_filter_doses()` — which downloads each dose's RTDOSE and keeps only those with `DoseSummationType == "PLAN"` (drops per-beam doses) — into `self.accepted_dose_ids`. `get_treatment_data()` and `get_dose_metrics()` both skip doses not in this list.
 - `get_patient_data()` — flat patient demographic/summary record for the `patients` table. Asserts the returned MRN matches the requested `patient_id`.
-- `get_treatment_data()` — finds all `dose` entities, walks up to their parent `plan`, downloads the RTPLAN DICOM, and extracts planning fields (`get_data_from_plan`) for the `doses` table. `plan_id`/`structure_set_id`/`image_set_id` on the dose link the family of objects together.
-- `get_dvh_data()` / `calculate_dvhs()` — for each dose, downloads the dose + structure set DICOM, computes a DVH per structure via `dicompylercore.dvhcalc`, and returns relative-volume cumulative DVH curves plus structure volume in cm³ for the `dvh_data` table. Zero-volume structures are dropped.
-- `get_geometrical_metrics()` / `calculate_geometrical_metrics()` — downloads the RTSTRUCT and its referenced image series, then delegates to [utils/geom_metrics.py](utils/geom_metrics.py) for the actual geometry math; flattens the resulting pairwise target/OAR metrics for the `geom_metrics` table.
+- `get_treatment_data()` — for each accepted dose, walks up to its parent `plan`, downloads the RTPLAN DICOM, and extracts planning fields (`get_data_from_plan`) for the `doses` table. `plan_id`/`structure_set_id`/`image_set_id` on the dose link the family of objects together.
+- `get_dose_metrics()` — for each accepted dose, downloads the dose's RTDOSE, RTSTRUCT, and (via `_download_image_slices()`) just 2 slices of its image set into one shared tempdir, then calls `calculate_dvhs()` and `calculate_geometrical_metrics()` against those shared downloads, returning `(dvh_data, geom_metrics)`. This single pass replaces what used to be two independent `get_dvh_data()`/`get_geometrical_metrics()` passes that each re-downloaded the structure set, and the whole image series just to read slice spacing/orientation off its DICOM headers.
+  - `calculate_dvhs()` parses the RTSTRUCT/RTDOSE once via `pydicom.dcmread` and passes the parsed `Dataset`s into `dicompylercore.dvhcalc.get_dvh()` for every structure — `get_dvh()` re-reads/re-parses its structure/dose arguments from disk on every call if given file paths instead of `Dataset`s. Returns relative-volume cumulative DVH curves plus structure volume in cm³ for the `dvh_data` table; zero-volume structures are dropped.
+  - `calculate_geometrical_metrics()` takes an already-downloaded RTSTRUCT path and image-slice directory and delegates to [utils/geom_metrics.py](utils/geom_metrics.py) for the geometry math; flattens the resulting pairwise target/OAR metrics for the `geom_metrics` table.
+  - `_download_image_slices()` streams individual images from an image set by position-sorted index, bypassing `ImageSetItem.download()`'s whole-series download; it reaches into SDK-internal attributes (`_requestor`/`_workspace_id`/`_id`) since the public SDK has no partial-download API.
 - All DICOM downloads go through `tempfile.TemporaryDirectory()` — nothing touching Proknow DICOM data is persisted to disk outside the harvest run.
 
 **[utils/geom_metrics.py](utils/geom_metrics.py)** — pure, stateless geometry helpers (no Proknow/DB dependency). Computes structure geometry directly from RTSTRUCT contour polygons (via Shapely) rather than rasterizing to a voxel grid, to avoid voxel quantization:
@@ -70,3 +72,7 @@ If you add a new `get_*` data source in `proknow_client.py`, add a corresponding
 - The CWP/EForms booking-form query only works on Windows due to trusted-connection auth.
 - CWP only returns the latest booking form, which may be wrong for re-treated patients.
 - The hash-based skip-if-unchanged optimization in `check_hash_in_db` is currently a no-op (the early `return` is commented out in `fetch_proknow_data`).
+
+## Instructions
+
+1. When you make code significant changes to the code (that would break the current tests in `./tests/`), make sure to update or add new tests. Tests are run after every git push, so I don't want to deal with broken tests. 

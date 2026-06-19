@@ -115,8 +115,9 @@ class ProknowHarvester:
         try:
             results["patient_data"].append(AskPK.get_patient_data())
             results["treatment_data"].extend(AskPK.get_treatment_data())
-            results["dvh_data"].extend(AskPK.get_dvh_data())
-            results["geom_metrics"].extend(AskPK.get_geometrical_metrics())
+            dvh_data, geom_metrics = AskPK.get_dose_metrics()
+            results["dvh_data"].extend(dvh_data)
+            results["geom_metrics"].extend(geom_metrics)
             # Add CWP call (booking_form) 
             #results["booking_form"].extend(AskCWP.get_booking_data()) #NOTE: append vs extend?
 

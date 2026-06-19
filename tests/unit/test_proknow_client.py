@@ -123,6 +123,29 @@ def test_get_patient_data_asserts_mrn_matches_requested_id():
 
 
 # --------------------------------------------------------------------------
+# _filter_doses
+# --------------------------------------------------------------------------
+
+def test_filter_doses_keeps_only_plan_summation_type(monkeypatch):
+    plan_dose = FakeEntity({"id": "d-plan", "type": "dose"}, download_path="/tmp/plan_dose.dcm")
+    beam_dose = FakeEntity({"id": "d-beam", "type": "dose"}, download_path="/tmp/beam_dose.dcm")
+    patient = FakePatientItem(
+        id="p", mrn="MRN1", name="N", birth_date="2000-01-01", sex="M", data={},
+        entities=[plan_dose, beam_dose],
+    )
+    ask = make_ask(patient=patient)
+
+    def fake_dcmread(path):
+        ds = pydicom.Dataset()
+        ds.DoseSummationType = "PLAN" if path == "/tmp/plan_dose.dcm" else "BEAM"
+        return ds
+
+    monkeypatch.setattr(pk_module.pydicom, "dcmread", fake_dcmread)
+
+    assert ask._filter_doses() == ["d-plan"]
+
+
+# --------------------------------------------------------------------------
 # get_data_from_plan
 # --------------------------------------------------------------------------
 
@@ -204,7 +227,7 @@ def test_get_treatment_data_links_dose_to_plan(monkeypatch):
         id="p", mrn="MRN1", name="N", birth_date="2000-01-01", sex="M", data={},
         entities=[dose_entity, plan_entity],
     )
-    ask = make_ask(patient=patient)
+    ask = make_ask(patient=patient, accepted_dose_ids=["dose-1"])
     monkeypatch.setattr(
         ask, "get_data_from_plan",
         lambda filepath: {
@@ -224,7 +247,47 @@ def test_get_treatment_data_links_dose_to_plan(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# calculate_dvhs / get_dvh_data
+# _download_image_slices
+# --------------------------------------------------------------------------
+
+class FakeRequestor:
+    def __init__(self):
+        self.calls = []
+
+    def stream(self, url, path):
+        self.calls.append((url, path))
+
+
+class FakeImageSet:
+    def __init__(self):
+        self.data = {
+            "data": {"images": [
+                {"uid": "uid-b", "pos": 2.0, "id": "img-b"},
+                {"uid": "uid-a", "pos": 1.0, "id": "img-a"},
+            ]},
+            "modality": "CT",
+        }
+        self._requestor = FakeRequestor()
+        self._workspace_id = "ws1"
+        self._id = "imgset1"
+
+
+def test_download_image_slices_sorts_by_position_and_streams_each(tmp_path):
+    image_set = FakeImageSet()
+
+    paths = AskProKnow._download_image_slices(image_set, str(tmp_path), indices=[0, 1])
+
+    # Sorted by position: uid-a (pos 1.0) before uid-b (pos 2.0), even though
+    # uid-b appears first in the unsorted image list.
+    assert [p.split("/")[-1] for p in paths] == ["CT.uid-a", "CT.uid-b"]
+    assert image_set._requestor.calls == [
+        ("/workspaces/ws1/imagesets/imgset1/images/img-a/dicom", paths[0]),
+        ("/workspaces/ws1/imagesets/imgset1/images/img-b/dicom", paths[1]),
+    ]
+
+
+# --------------------------------------------------------------------------
+# calculate_dvhs
 # --------------------------------------------------------------------------
 
 class FakeDVHResult:
@@ -243,30 +306,33 @@ class FakeDVH:
 
 
 def test_calculate_dvhs_drops_zero_volume_structures(monkeypatch):
-    dose_entity = FakeEntity({"id": "dose-1"}, download_path="/tmp/dose.dcm")
-    ss_entity = FakeEntity({"id": "ss-1"}, download_path="/tmp/struct.dcm")
-    patient = FakePatientItem(
-        id="p", mrn="MRN1", name="N", birth_date="2000-01-01", sex="M", data={},
-        entities=[dose_entity, ss_entity],
-    )
-    ask = make_ask(patient=patient)
+    ask = make_ask()
+
+    fake_ds_struct = object()
+    fake_ds_dose = object()
+
+    def fake_dcmread(path):
+        return {"structpath": fake_ds_struct, "dosepath": fake_ds_dose}[path]
 
     class FakeDicomParser:
-        def __init__(self, path):
-            pass
+        def __init__(self, dataset):
+            assert dataset is fake_ds_struct
 
         def GetStructures(self):
             return {1: {"name": "PTV"}, 2: {"name": "ZeroVolStruct"}}
 
-    def fake_get_dvh(structpath, dosepath, idx, interpolation_resolution=1.0):
+    def fake_get_dvh(ds_struct, ds_dose, idx, interpolation_resolution=1.0):
+        assert ds_struct is fake_ds_struct
+        assert ds_dose is fake_ds_dose
         if idx == 1:
             return FakeDVH(volume=12.34567, counts=[1.0, 0.9, 0.5, 0.0])
         return FakeDVH(volume=0.0, counts=[0.0])
 
+    monkeypatch.setattr(pk_module.pydicom, "dcmread", fake_dcmread)
     monkeypatch.setattr(pk_module.dicomparser, "DicomParser", FakeDicomParser)
     monkeypatch.setattr(pk_module.dvhcalc, "get_dvh", fake_get_dvh)
 
-    result = ask.calculate_dvhs("dose-1", "ss-1")
+    result = ask.calculate_dvhs("dose-1", "structpath", "dosepath")
 
     assert len(result) == 1
     assert result[0] == {
@@ -275,44 +341,12 @@ def test_calculate_dvhs_drops_zero_volume_structures(monkeypatch):
     }
 
 
-def test_get_dvh_data_aggregates_across_doses(monkeypatch):
-    dose1 = FakeEntity({"id": "d1", "type": "dose", "structure_set_id": "ss1"})
-    dose2 = FakeEntity({"id": "d2", "type": "dose", "structure_set_id": "ss2"})
-    patient = FakePatientItem(
-        id="p", mrn="MRN1", name="N", birth_date="2000-01-01", sex="M", data={},
-        entities=[dose1, dose2],
-    )
-    ask = make_ask(patient=patient)
-
-    calls = []
-
-    def fake_calculate_dvhs(dose_id, structure_set_id):
-        calls.append((dose_id, structure_set_id))
-        return [{"dose_id": dose_id, "structure_name": "x"}]
-
-    monkeypatch.setattr(ask, "calculate_dvhs", fake_calculate_dvhs)
-
-    result = ask.get_dvh_data()
-
-    assert calls == [("d1", "ss1"), ("d2", "ss2")]
-    assert result == [
-        {"dose_id": "d1", "structure_name": "x"},
-        {"dose_id": "d2", "structure_name": "x"},
-    ]
-
-
 # --------------------------------------------------------------------------
-# calculate_geometrical_metrics / get_geometrical_metrics
+# calculate_geometrical_metrics
 # --------------------------------------------------------------------------
 
 def test_calculate_geometrical_metrics_orchestration(monkeypatch):
-    struct_entity = FakeEntity({"id": "ss-1"}, download_path="/tmp/struct.dcm")
-    image_entity = FakeEntity({"id": "img-1"}, download_path="/tmp/img-marker")
-    patient = FakePatientItem(
-        id="p", mrn="MRN1", name="N", birth_date="2000-01-01", sex="M", data={},
-        entities=[struct_entity, image_entity],
-    )
-    ask = make_ask(patient=patient)
+    ask = make_ask()
 
     class FakeStructParser:
         def __init__(self, path):
@@ -334,7 +368,10 @@ def test_calculate_geometrical_metrics_orchestration(monkeypatch):
         ],
     )
 
-    result = ask.calculate_geometrical_metrics(structure_set_id="ss-1", image_set_id="img-1")
+    result = ask.calculate_geometrical_metrics(
+        structure_set_id="ss-1", image_set_id="img-1",
+        struct_path="ignored-struct-path", image_dir="ignored-image-dir",
+    )
 
     assert result["structure_set_id"] == "ss-1"
     assert result["image_set_id"] == "img-1"
@@ -345,23 +382,71 @@ def test_calculate_geometrical_metrics_orchestration(monkeypatch):
     assert pm["oar"] == "Heart"
 
 
-def test_get_geometrical_metrics_stamps_dose_and_structure_set_id(monkeypatch):
-    dose1 = FakeEntity({"id": "d1", "type": "dose", "structure_set_id": "ss1", "image_set_id": "img1"})
-    dose2 = FakeEntity({"id": "d2", "type": "dose", "structure_set_id": "ss2", "image_set_id": "img2"})
+# --------------------------------------------------------------------------
+# get_dose_metrics
+# --------------------------------------------------------------------------
+
+def test_get_dose_metrics_orchestrates_dvh_and_geometry_per_accepted_dose(monkeypatch):
+    dose_entity = FakeEntity(
+        {"id": "d1", "type": "dose", "structure_set_id": "ss1", "image_set_id": "img1"},
+        download_path="/tmp/d1-dose.dcm",
+    )
+    ss_entity = FakeEntity({"id": "ss1", "type": "structure_set"}, download_path="/tmp/ss1-struct.dcm")
+    img_entity = FakeEntity({"id": "img1", "type": "image_set"})
     patient = FakePatientItem(
         id="p", mrn="MRN1", name="N", birth_date="2000-01-01", sex="M", data={},
-        entities=[dose1, dose2],
+        entities=[dose_entity, ss_entity, img_entity],
     )
-    ask = make_ask(patient=patient)
+    ask = make_ask(patient=patient, accepted_dose_ids=["d1"])
 
-    def fake_calc(structure_set_id, image_set_id):
-        return {"pairwise_metrics": [{"target": "PTV", "oar": "Heart"}]}
+    monkeypatch.setattr(ask, "_download_image_slices", lambda image_set, tmpdir, indices: [])
+    monkeypatch.setattr(
+        ask, "calculate_dvhs",
+        lambda dose_id, structpath, dosepath: [{"dose_id": dose_id, "structure_name": "PTV"}],
+    )
+    monkeypatch.setattr(
+        ask, "calculate_geometrical_metrics",
+        lambda structure_set_id, image_set_id, struct_path, image_dir: {
+            "pairwise_metrics": [{"target": "PTV", "oar": "Heart"}],
+        },
+    )
 
-    monkeypatch.setattr(ask, "calculate_geometrical_metrics", fake_calc)
+    dvh_data, geom_metrics = ask.get_dose_metrics()
 
-    result = ask.get_geometrical_metrics()
-
-    assert result == [
+    assert dvh_data == [{"dose_id": "d1", "structure_name": "PTV"}]
+    assert geom_metrics == [
         {"target": "PTV", "oar": "Heart", "dose_id": "d1", "structure_set_id": "ss1"},
-        {"target": "PTV", "oar": "Heart", "dose_id": "d2", "structure_set_id": "ss2"},
     ]
+
+
+def test_get_dose_metrics_skips_doses_not_in_accepted_dose_ids(monkeypatch):
+    accepted = FakeEntity(
+        {"id": "d1", "type": "dose", "structure_set_id": "ss1", "image_set_id": "img1"},
+        download_path="/tmp/d1-dose.dcm",
+    )
+    rejected = FakeEntity(
+        {"id": "d2", "type": "dose", "structure_set_id": "ss2", "image_set_id": "img2"},
+    )
+    ss_entity = FakeEntity({"id": "ss1", "type": "structure_set"}, download_path="/tmp/ss1-struct.dcm")
+    img_entity = FakeEntity({"id": "img1", "type": "image_set"})
+    patient = FakePatientItem(
+        id="p", mrn="MRN1", name="N", birth_date="2000-01-01", sex="M", data={},
+        entities=[accepted, rejected, ss_entity, img_entity],
+    )
+    # d2 is excluded, e.g. because _filter_doses found its DoseSummationType == "BEAM".
+    ask = make_ask(patient=patient, accepted_dose_ids=["d1"])
+
+    calls = []
+    monkeypatch.setattr(ask, "_download_image_slices", lambda image_set, tmpdir, indices: [])
+    monkeypatch.setattr(
+        ask, "calculate_dvhs",
+        lambda dose_id, structpath, dosepath: calls.append(dose_id) or [],
+    )
+    monkeypatch.setattr(
+        ask, "calculate_geometrical_metrics",
+        lambda structure_set_id, image_set_id, struct_path, image_dir: {"pairwise_metrics": []},
+    )
+
+    ask.get_dose_metrics()
+
+    assert calls == ["d1"]

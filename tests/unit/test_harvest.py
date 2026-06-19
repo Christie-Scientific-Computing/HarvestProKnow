@@ -190,13 +190,9 @@ class FakeAskProKnow:
         self._maybe_raise("get_treatment_data")
         return self._treatment_data
 
-    def get_dvh_data(self):
-        self._maybe_raise("get_dvh_data")
-        return self._dvh_data
-
-    def get_geometrical_metrics(self):
-        self._maybe_raise("get_geometrical_metrics")
-        return self._geom_metrics
+    def get_dose_metrics(self):
+        self._maybe_raise("get_dose_metrics")
+        return self._dvh_data, self._geom_metrics
 
 
 def test_fetch_proknow_data_returns_none_when_patient_not_found(monkeypatch, fake_cursor, fake_connection):
@@ -214,7 +210,7 @@ def test_fetch_proknow_data_returns_none_when_a_getter_raises(monkeypatch, fake_
     fake_cursor._fetchone_result = (False,)
     monkeypatch.setattr(
         harvest, "AskProKnow",
-        lambda patient_id: FakeAskProKnow(patient_id, raise_method="get_dvh_data"),
+        lambda patient_id: FakeAskProKnow(patient_id, raise_method="get_dose_metrics"),
     )
     harvester = make_harvester(conn=fake_connection)
 

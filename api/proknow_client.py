@@ -175,74 +175,108 @@ class AskProKnow():
             "treatment_site": site,
         }
 
-    ## ============  DVH_DATA table =================
-    def get_dvh_data(self) -> dict:
+    ## ============  DVH_DATA + GEOMETRICAL METRICS ================
+
+    def get_dose_metrics(self) -> tuple[list[dict], list[dict]]:
+        """
+        Computes DVH data and geometrical metrics for every accepted dose.
+        Each dose's RTDOSE, RTSTRUCT, and a slice subset of its image set are
+        downloaded once and shared between the two calculations (previously
+        fetched/downloaded independently by each).
+        """
         doses = self.patient.find_entities(lambda entity: entity.data['type'] == 'dose')
 
-        all_data = []
+        dvh_data = []
+        geom_metrics = []
         for dose in doses:
             if dose.data['id'] not in self.accepted_dose_ids:
                 continue
-            all_data.extend(self.calculate_dvhs(dose.data['id'], dose.data['structure_set_id']))
-        return all_data
+            dose_id = dose.data['id']
+            structure_set_id = dose.data['structure_set_id']
+            image_set_id = dose.data['image_set_id']
 
+            dose_item = self.patient.find_entities(lambda entity: entity.data['id'] == dose_id)[0].get()
+            structure_set = self.patient.find_entities(lambda entity: entity.data['id'] == structure_set_id)[0].get()
+            image_set = self.patient.find_entities(lambda entity: entity.data['id'] == image_set_id)[0].get()
 
-    def calculate_dvhs(self, dose_id: str, structure_set_id: str) -> list[dict]:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                dosepath = dose_item.download(tmpdir)
+                structpath = structure_set.download(tmpdir)
+                image_dir = os.path.join(tmpdir, "image")
+                os.makedirs(image_dir)
+                # Only 2 adjacent slices are needed for axial-orientation
+                # validation and true slice spacing, not the whole series.
+                self._download_image_slices(image_set, image_dir, indices=[0, 1])
+
+                dvh_data.extend(self.calculate_dvhs(dose_id, structpath, dosepath))
+
+                metrics = self.calculate_geometrical_metrics(structure_set_id, image_set_id, structpath, image_dir)
+                for metric_ in metrics['pairwise_metrics']:
+                    metric_['dose_id'] = dose_id
+                    metric_['structure_set_id'] = structure_set_id
+                    geom_metrics.append(metric_)
+
+        return dvh_data, geom_metrics
+
+    @staticmethod
+    def _download_image_slices(image_set, tmpdir: str, indices: list[int]) -> list[str]:
         """
-        Method to get DVHs for each structure in a consistent format. 
-        Expects PK dose_id and associated parent structure_set_id
+        Download only specific images from an image set, by position-sorted
+        index, instead of ImageSetItem.download()'s whole-series download.
+        Mirrors the per-image request ImageSetItem.download() makes
+        internally; relies on ProKnow SDK internals since there's no public
+        partial-download API.
         """
+        images = sorted(image_set.data["data"]["images"], key=lambda img: img["pos"])
+        modality = image_set.data["modality"]
+        paths = []
+        for i in indices:
+            image = images[i]
+            path = os.path.join(tmpdir, f"{modality}.{image['uid']}")
+            image_set._requestor.stream(
+                f"/workspaces/{image_set._workspace_id}/imagesets/{image_set._id}/images/{image['id']}/dicom",
+                path,
+            )
+            paths.append(path)
+        return paths
 
-        dose = self.patient.find_entities(lambda entity: entity.data['id'] == dose_id)[0].get()
-        structure_set = self.patient.find_entities(lambda entity: entity.data['id'] == structure_set_id)[0].get()
+    def calculate_dvhs(self, dose_id: str, structpath: str, dosepath: str) -> list[dict]:
+        """
+        Method to get DVHs for each structure in a consistent format.
+        Expects already-downloaded RTSTRUCT/RTDOSE file paths for the dose.
+        """
+        # Parsed once and reused across structures: dvhcalc.get_dvh() re-reads
+        # its structure/dose arguments from disk on every call if given file
+        # paths, but accepts pre-parsed pydicom Datasets instead.
+        ds_struct = pydicom.dcmread(structpath)
+        ds_dose = pydicom.dcmread(dosepath)
+        struct = dicomparser.DicomParser(ds_struct)
+        structures = struct.GetStructures()
 
         results = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dosepath = dose.download(tmpdir)
-            structpath = structure_set.download(tmpdir)
-            struct = dicomparser.DicomParser(structpath)
-            structures = struct.GetStructures() 
-            for idx in structures:
-                name = structures[idx]['name']
-                dvh = dvhcalc.get_dvh(structpath, dosepath, idx, interpolation_resolution=1.)
-                volume = round(dvh.volume, 4)
-                dvh = dvh.relative_volume
-                payload = {
-                    'dose_id': dose_id,
-                    'structure_name': name,
-                    'cumulative_dvh': dvh.counts.tolist(),
-                    'volume': volume,
-                    'bin_width': 0.01
-                }
-                #dvh.plot()
-                if payload['volume'] == 0:
-                    continue
-                results.append(payload)
-        return results
-    
-    ## ========== GEOMETRICAL METRICS ================
-
-    def get_geometrical_metrics(self) -> list[dict]:
-        # Only care about structure_sets linked to a dose
-        doses = self.patient.find_entities(lambda entity: entity.data['type'] == 'dose')
-        all_data = []
-        for dose in doses:
-            if dose.data['id'] not in self.accepted_dose_ids:
+        for idx in structures:
+            name = structures[idx]['name']
+            dvh = dvhcalc.get_dvh(ds_struct, ds_dose, idx, interpolation_resolution=1.)
+            volume = round(dvh.volume, 4)
+            dvh = dvh.relative_volume
+            payload = {
+                'dose_id': dose_id,
+                'structure_name': name,
+                'cumulative_dvh': dvh.counts.tolist(),
+                'volume': volume,
+                'bin_width': 0.01
+            }
+            #dvh.plot()
+            if payload['volume'] == 0:
                 continue
-            metrics = self.calculate_geometrical_metrics( dose.data['structure_set_id'], dose.data['image_set_id'])
-            pairwise_metrics = metrics['pairwise_metrics']
-            for metric_ in pairwise_metrics:
-                metric_['dose_id'] = dose.data['id']
-                metric_['structure_set_id'] = dose.data['structure_set_id']
-            #self.to_json('METRICS', metrics)
-            #break
-                all_data.append(metric_)
-        return all_data
+            results.append(payload)
+        return results
 
-    def calculate_geometrical_metrics(self, structure_set_id: str, image_set_id: str) -> dict:
+    def calculate_geometrical_metrics(self, structure_set_id: str, image_set_id: str, struct_path: str, image_dir: str) -> dict:
         """
-        Given a structure set id and its referenced image set id, fetch the RTSTRUCT
-        (and image series) and calculate a range of metrics:
+        Given an already-downloaded RTSTRUCT path and a directory containing
+        a slice subset of the referenced image set, calculate a range of
+        metrics:
             - pairwise metrics between targets (name contains 'TV') and all OARs
             (excludes body / external):
                 * Dice coefficient
@@ -258,119 +292,103 @@ class AskProKnow():
 
         Note: Code generated by Claude Opus 4.8
         """
-        structure_set = self.patient.find_entities(
-            lambda entity: entity.data["id"] == structure_set_id
-        )[0].get()
-        image_set = self.patient.find_entities(
-            lambda entity: entity.data["id"] == image_set_id
-        )[0].get()
+        parser = dicomparser.DicomParser(struct_path)
+        raw_structures = parser.GetStructures()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            struct_dir = os.path.join(tmpdir, "rtstruct")
-            image_dir = os.path.join(tmpdir, "image")
-            os.makedirs(struct_dir)
-            os.makedirs(image_dir)
+        # 1. Parse contours into per-slice polygons; skip ROIs without geometry.
+        parsed: dict[int, dict] = {}
+        contour_z: list[float] = []
+        for roi_number, meta in raw_structures.items():
+            try:
+                coords = parser.GetStructureCoordinates(roi_number)
+            except KeyError:
+                continue
+            if not coords:
+                continue
+            slices = gm._structure_slices(coords)
+            if not slices:
+                continue
+            parsed[roi_number] = {"meta": meta, "slices": slices}
+            contour_z.extend(slices.keys())
 
-            struct_path = structure_set.download(struct_dir)
-            image_set.download(image_dir)
+        # 2. Validate axial acquisition and take the authoritative slice
+        #    thickness from the image, falling back to contour z-gaps only if
+        #    the image cannot be read.
+        planes = gm._read_image_planes(image_dir)
+        if planes:
+            gm._assert_axial_orientation(planes)
+            thickness = gm._slice_thickness_mm(np.array([z for z, _ in planes]))
+        else:
+            thickness = None
+        if thickness is None:
+            thickness = gm._slice_thickness_mm(np.asarray(contour_z))
+        if thickness is None:
+            raise ValueError(
+                "Cannot determine slice thickness from image set or contours "
+                "(fewer than two planes)."
+            )
 
-            parser = dicomparser.DicomParser(struct_path)
-            raw_structures = parser.GetStructures()
-           
-            # 1. Parse contours into per-slice polygons; skip ROIs without geometry.
-            parsed: dict[int, dict] = {}
-            contour_z: list[float] = []
-            for roi_number, meta in raw_structures.items():
-                try:
-                    coords = parser.GetStructureCoordinates(roi_number)
-                except KeyError:
+        # 3. Derive per-structure quantities and classify.
+        structures: dict[int, gm.StructureGeometry] = {}
+        for roi_number, entry in parsed.items():
+            slices = entry["slices"]
+            volume_mm3 = gm._volume_mm3(slices, thickness)
+            structures[roi_number] = gm.StructureGeometry(
+                name=entry["meta"]["name"],
+                role=gm._classify(entry["meta"]["name"], entry["meta"].get("type", "")),
+                slices=slices,
+                volume_mm3=volume_mm3,
+                centroid_mm=gm._centroid_mm(slices, thickness, volume_mm3),
+                surface_points_mm=gm._surface_points(slices),
+            )
+
+        targets = [s for s in structures.values() if s.role == gm.ROLE_TARGET]
+        oars = [s for s in structures.values() if s.role == gm.ROLE_OAR]
+
+        # 4. Pairwise target/OAR metrics (skip degenerate zero-volume structures).
+        pairwise = []
+        for target in targets:
+            if target.volume_mm3 <= 0:
+                continue
+            for oar in oars:
+                if oar.volume_mm3 <= 0:
                     continue
-                if not coords:
-                    continue
-                slices = gm._structure_slices(coords)
-                if not slices:
-                    continue
-                parsed[roi_number] = {"meta": meta, "slices": slices}
-                contour_z.extend(slices.keys())
-
-            # 2. Validate axial acquisition and take the authoritative slice
-            #    thickness from the image, falling back to contour z-gaps only if
-            #    the image cannot be read.
-            planes = gm._read_image_planes(image_dir)
-            if planes:
-                gm._assert_axial_orientation(planes)
-                thickness = gm._slice_thickness_mm(np.array([z for z, _ in planes]))
-            else:
-                thickness = None
-            if thickness is None:
-                thickness = gm._slice_thickness_mm(np.asarray(contour_z))
-            if thickness is None:
-                raise ValueError(
-                    "Cannot determine slice thickness from image set or contours "
-                    "(fewer than two planes)."
+                displacement = oar.centroid_mm - target.centroid_mm  # mm, target -> OAR
+                min_dist, hd95_dist = gm._surface_distances(
+                    target.surface_points_mm, oar.surface_points_mm
+                )
+                pairwise.append(
+                    {
+                        "target": target.name,
+                        "oar": oar.name,
+                        "dice": round(gm._dice(target, oar, thickness), gm._DICE_DP),
+                        "relative_overlap": round(gm._relative_overlap(target, oar, thickness), gm._DICE_DP),
+                        "distance_vector_mm": [
+                            round(float(d), gm._DISTANCE_DP) for d in displacement
+                        ],
+                        "distance_mm": round(float(np.linalg.norm(displacement)), gm._DISTANCE_DP),
+                        "min_surface_distance_mm": (
+                            round(min_dist, gm._DISTANCE_DP) if min_dist is not None else None
+                        ),
+                        "hd95_surface_distance_mm": (
+                            round(hd95_dist, gm._DISTANCE_DP) if hd95_dist is not None else None
+                        ),
+                    }
                 )
 
-            # 3. Derive per-structure quantities and classify.
-            structures: dict[int, gm.StructureGeometry] = {}
-            for roi_number, entry in parsed.items():
-                slices = entry["slices"]
-                volume_mm3 = gm._volume_mm3(slices, thickness)
-                structures[roi_number] = gm.StructureGeometry(
-                    name=entry["meta"]["name"],
-                    role=gm._classify(entry["meta"]["name"], entry["meta"].get("type", "")),
-                    slices=slices,
-                    volume_mm3=volume_mm3,
-                    centroid_mm=gm._centroid_mm(slices, thickness, volume_mm3),
-                    surface_points_mm=gm._surface_points(slices),
-                )
-
-            targets = [s for s in structures.values() if s.role == gm.ROLE_TARGET]
-            oars = [s for s in structures.values() if s.role == gm.ROLE_OAR]
-
-            # 4. Pairwise target/OAR metrics (skip degenerate zero-volume structures).
-            pairwise = []
-            for target in targets:
-                if target.volume_mm3 <= 0:
-                    continue
-                for oar in oars:
-                    if oar.volume_mm3 <= 0:
-                        continue
-                    displacement = oar.centroid_mm - target.centroid_mm  # mm, target -> OAR
-                    min_dist, hd95_dist = gm._surface_distances(
-                        target.surface_points_mm, oar.surface_points_mm
-                    )
-                    pairwise.append(
-                        {
-                            "target": target.name,
-                            "oar": oar.name,
-                            "dice": round(gm._dice(target, oar, thickness), gm._DICE_DP),
-                            "relative_overlap": round(gm._relative_overlap(target, oar, thickness), gm._DICE_DP),
-                            "distance_vector_mm": [
-                                round(float(d), gm._DISTANCE_DP) for d in displacement
-                            ],
-                            "distance_mm": round(float(np.linalg.norm(displacement)), gm._DISTANCE_DP),
-                            "min_surface_distance_mm": (
-                                round(min_dist, gm._DISTANCE_DP) if min_dist is not None else None
-                            ),
-                            "hd95_surface_distance_mm": (
-                                round(hd95_dist, gm._DISTANCE_DP) if hd95_dist is not None else None
-                            ),
-                        }
-                    )
-
-            structure_info = [
-                {
-                    "name": s.name,
-                    "role": s.role,
-                    "volume_cc": round(s.volume_cc, gm._VOLUME_DP),
-                    "centroid_mm": (
-                        [round(float(c), gm._DISTANCE_DP) for c in s.centroid_mm]
-                        if s.centroid_mm is not None
-                        else None
-                    ),
-                }
-                for s in structures.values()
-            ]
+        structure_info = [
+            {
+                "name": s.name,
+                "role": s.role,
+                "volume_cc": round(s.volume_cc, gm._VOLUME_DP),
+                "centroid_mm": (
+                    [round(float(c), gm._DISTANCE_DP) for c in s.centroid_mm]
+                    if s.centroid_mm is not None
+                    else None
+                ),
+            }
+            for s in structures.values()
+        ]
 
         return {
             "structure_set_id": structure_set_id,
