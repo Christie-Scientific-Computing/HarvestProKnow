@@ -6,5 +6,9 @@ Given a list of IDS, will fetch (1) proknow metadata, (2) scorecards? (3) custom
 E.g. of stats calculated locally:
     - Distance between specific OARs.
 
+# Design and link to EDNA
+![System design](./static/Donal-Diagram.svg)
+
 # TODO
     - Don't rely on patient IDs. 
+    - Querying CWP only works on Windows (user authentication)

@@ -88,37 +88,42 @@ class ProknowHarvester:
             raise
         return patient_ids
 
-    def fetch_proknow_data(self, patient_ids: list[str]) -> dict:
+    def fetch_proknow_data(self, patient_id: str) -> dict:
         """Fetch data from Proknow for given patient IDs."""
         
         # NOTE: Add extra result types here
         results = {
             "patient_data": [],
             "treatment_data": [],
-            "dvh_data": []
+            "dvh_data": [],
+            "geom_metrics": []
         }
 
-        for patient_id in patient_ids:
-            logger.info(f"Fetching data for {patient_id}")
-            # NOTE: Will skip patient if patient summary has not changed
-            AskPK = AskProKnow(patient_id)
-            if AskPK.patient_summary is None:
-                continue
-            #AskCWP_ = AskCWP(patient_id)
 
-            # Checks hash against db
-            if self.check_hash_in_db(AskPK.patient_hash):
-                logger.info("Patient already in db, skipping")
-                #continue
-            try:
-                results["patient_data"].append(AskPK.get_patient_data())
-                results["treatment_data"].extend(AskPK.get_treatment_data())
-                results["dvh_data"].extend(AskPK.get_dvh_data())
-                logger.debug(f"Fetched data for patient {patient_id}")
+        logger.info(f"Fetching data for {patient_id}")
+        # NOTE: Will skip patient if patient summary has not changed
+        AskPK = AskProKnow(patient_id)
+        if AskPK.patient_summary is None:
+            return
+        #AskCWP_ = AskCWP(patient_id)
 
-            except Exception as e:
-                logger.error(f"Failed to fetch data for patient {patient_id}: {e}")
-                continue
+        # Checks hash against db
+        if self.check_hash_in_db(AskPK.patient_hash):
+            logger.info("Patient already in db, skipping")
+            #return
+        try:
+            results["patient_data"].append(AskPK.get_patient_data())
+            results["treatment_data"].extend(AskPK.get_treatment_data())
+            #results["dvh_data"].extend(AskPK.get_dvh_data())
+            results["geom_metrics"].extend(AskPK.get_geometrical_metrics())
+            # Add CWP call (booking_form) 
+            #results["booking_form"].extend(AskCWP.get_booking_data()) #NOTE: append vs extend?
+
+            logger.debug(f"Fetched data for patient {patient_id}")
+
+        except Exception as e:
+            logger.error(f"Failed to fetch data for patient {patient_id}: {e}")
+            return
 
             #AskCWP_.disconnect()
         
@@ -142,6 +147,9 @@ class ProknowHarvester:
             if results["dvh_data"]:
                 self._write_table(cursor, "dvh_data", results["dvh_data"], id_col=("dose_id", "structure_name"))
 
+            if results["geom_metrics"]:
+                self._write_table(cursor, "geom_metrics", results["geom_metrics"], id_col=("dose_id", "structure_set_id", "target", "oar"))
+
             self.conn.commit()
             logger.info("Successfully wrote results to database")
 
@@ -156,7 +164,7 @@ class ProknowHarvester:
         """Helper to write data to a specific table."""
         if not data:
             return
-
+        
         columns = list(data[0].keys())
         placeholders = ", ".join(["%s"] * len(columns))
         
@@ -181,11 +189,12 @@ class ProknowHarvester:
         logger.info("Starting Proknow harvest")
 
         patient_ids = self.read_patient_ids(csv_path)
-        results = self.fetch_proknow_data(patient_ids)
-        if results:
-            self.write_results_to_db(results)
-        else:
-            logger.warning("No results found!")
+        for patient_id in patient_ids:
+            results = self.fetch_proknow_data(patient_id)
+            if results:
+                self.write_results_to_db(results)
+            else:
+                logger.warning("No results found!")
         logger.info("Proknow harvest completed")
 
 

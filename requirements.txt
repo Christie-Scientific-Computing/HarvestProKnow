@@ -6,8 +6,11 @@ dicompyler-core==0.5.6
 dotenv==0.9.9
 fonttools==4.63.0
 idna==3.18
+ImageIO==2.37.3
 kiwisolver==1.5.0
+lazy-loader==0.5
 matplotlib==3.11.0
+networkx==3.6.1
 numpy==2.4.6
 packaging==26.2
 pillow==12.2.0
@@ -21,5 +24,9 @@ pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 requests==2.34.2
+scikit-image==0.26.0
+scipy==1.17.1
+shapely==2.1.2
 six==1.17.0
+tifffile==2026.6.1
 urllib3==2.7.0
