@@ -1,7 +1,7 @@
 # Path to CSV with patient IDs
 path_to_csv='./data/all_HnN_ids.csv'
 # If true, will write to logfile to log-dir
-log-to-file=false
+log-to-file=true
 # Directory where logs should be written. Will be created if doesn't exist.
 # Ignored if log-to-file is false
 log-dir='./logs/' 

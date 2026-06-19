@@ -183,12 +183,13 @@ class AskProKnow():
             for idx in structures:
                 name = structures[idx]['name']
                 dvh = dvhcalc.get_dvh(structpath, dosepath, idx, interpolation_resolution=1.)
+                volume = round(dvh.volume, 4)
                 dvh = dvh.relative_volume
                 payload = {
                     'dose_id': dose_id,
                     'structure_name': name,
                     'cumulative_dvh': dvh.counts.tolist(),
-                    'volume': dvh.volume,
+                    'volume': volume,
                     'bin_width': 0.01
                 }
                 #dvh.plot()

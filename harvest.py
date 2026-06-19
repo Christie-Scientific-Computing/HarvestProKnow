@@ -9,6 +9,7 @@ import csv
 import logging
 import psycopg
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 from api import AskProKnow
 from api import AskCWP
@@ -114,7 +115,7 @@ class ProknowHarvester:
         try:
             results["patient_data"].append(AskPK.get_patient_data())
             results["treatment_data"].extend(AskPK.get_treatment_data())
-            #results["dvh_data"].extend(AskPK.get_dvh_data())
+            results["dvh_data"].extend(AskPK.get_dvh_data())
             results["geom_metrics"].extend(AskPK.get_geometrical_metrics())
             # Add CWP call (booking_form) 
             #results["booking_form"].extend(AskCWP.get_booking_data()) #NOTE: append vs extend?
@@ -189,7 +190,7 @@ class ProknowHarvester:
         logger.info("Starting Proknow harvest")
 
         patient_ids = self.read_patient_ids(csv_path)
-        for patient_id in patient_ids:
+        for patient_id in tqdm(patient_ids):
             results = self.fetch_proknow_data(patient_id)
             if results:
                 self.write_results_to_db(results)
