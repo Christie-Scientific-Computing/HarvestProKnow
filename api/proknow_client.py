@@ -34,7 +34,24 @@ class AskProKnow():
         #self.to_json(patient_id, self.patient.data)
         # Calc patient hash to check if known 
         self.patient_hash = self._calc_patient_hash(self.patient.data)
+
+        # Downloads RTDOSEs for this patient and extracts the DoseSummationType tag. 
+        # Where type == BEAM, doses are dropped.
+        self.accepted_dose_ids = self._filter_doses()
     
+    def _filter_doses(self):
+        accepted_ids = []
+        doses = self.patient.find_entities(lambda entity: entity.data['type'] == 'dose')
+        for dose_ in doses:
+            dose = dose_.get() 
+            with tempfile.TemporaryDirectory() as tmpdir:
+                dosepath = dose.download(tmpdir)
+                ds = pydicom.dcmread(dosepath)
+                if ds.DoseSummationType == "PLAN":
+                    accepted_ids.append(dose.data['id'])
+
+        return accepted_ids
+
     @staticmethod
     def _calc_patient_hash(data: dict) -> str:
         """
@@ -51,7 +68,7 @@ class AskProKnow():
         with open(f'./tmp/{filename}.json', 'w') as f:
             json.dump(data, f, indent=4)
 
-    def find_patient(self, patient_id: str) -> ProKnow.PatientItem:
+    def find_patient(self, patient_id: str) -> ProKnow.Patients.PatientItemPatientItem:
         """Gets respective PatientItem for a given patient"""
         #patients = self.pk.patients.lookup(self.workspace, [patient_id])
         patients = self.pk.patients.query(self.workspace, search=patient_id)
@@ -97,6 +114,8 @@ class AskProKnow():
         doses = self.patient.find_entities(lambda entity: entity.data['type'] == 'dose')
         payload = []
         for dose in doses:
+            if dose.data['id'] not in self.accepted_dose_ids:
+                continue
             # Get all parent data to this dose
             data = {
                 "id": dose.data["id"],
@@ -143,7 +162,7 @@ class AskProKnow():
             plan_date = ds.get("RTPlanDate")
         else:
             plan_date = ds.get("SeriesDate")
-        plan_date = datetime.strptime(plan_date, '%Y%M%d').date()
+        plan_date = datetime.strptime(plan_date, '%Y%m%d').date()
         site = ds.get("TreatmentSites")
         
         return {
@@ -161,11 +180,13 @@ class AskProKnow():
 
         all_data = []
         for dose in doses:
+            if dose.data['id'] not in self.accepted_dose_ids:
+                continue
             all_data.extend(self.calculate_dvhs(dose.data['id'], dose.data['structure_set_id']))
         return all_data
 
 
-    def calculate_dvhs(self, dose_id: str, structure_set_id: str):
+    def calculate_dvhs(self, dose_id: str, structure_set_id: str) -> list[dict]:
         """
         Method to get DVHs for each structure in a consistent format. 
         Expects PK dose_id and associated parent structure_set_id
@@ -200,11 +221,13 @@ class AskProKnow():
     
     ## ========== GEOMETRICAL METRICS ================
 
-    def get_geometrical_metrics(self):
+    def get_geometrical_metrics(self) -> list[dict]:
         # Only care about structure_sets linked to a dose
         doses = self.patient.find_entities(lambda entity: entity.data['type'] == 'dose')
         all_data = []
         for dose in doses:
+            if dose.data['id'] not in self.accepted_dose_ids:
+                continue
             metrics = self.calculate_geometrical_metrics( dose.data['structure_set_id'], dose.data['image_set_id'])
             pairwise_metrics = metrics['pairwise_metrics']
             for metric_ in pairwise_metrics:
