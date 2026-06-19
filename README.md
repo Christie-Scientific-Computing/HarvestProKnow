@@ -1,5 +1,5 @@
 ## Harvest Proknow
-
+[![Tests](https://github.com/Christie-Scientific-Computing/HarvestProKnow/actions/workflows/tests.yml/badge.svg)](https://github.com/Christie-Scientific-Computing/HarvestProKnow/actions/workflows/tests.yml)
 Queries Proknow, collects data and writes to the BigDB (psql@192.168.117:32899). This script should be run fairly regularly to make sure the DB stays up-to-date.
 
 Used alongside EDNA as part of the Continuous Improvement platform.
