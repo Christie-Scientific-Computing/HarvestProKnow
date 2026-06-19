@@ -11,6 +11,7 @@ import numpy as np
 from datetime import datetime
 from hashlib import sha256
 from proknow import ProKnow
+from proknow.Patients import PatientItem
 from dicompylercore import dicomparser, dvhcalc
 
 import utils.geom_metrics as gm
@@ -51,7 +52,7 @@ class AskProKnow():
         with open(f'./tmp/{filename}.json', 'w') as f:
             json.dump(data, f, indent=4)
 
-    def find_patient(self, patient_id: str) -> ProKnow.PatientItem:
+    def find_patient(self, patient_id: str) -> PatientItem:
         """Gets respective PatientItem for a given patient"""
         #patients = self.pk.patients.lookup(self.workspace, [patient_id])
         patients = self.pk.patients.query(self.workspace, search=patient_id)
@@ -143,7 +144,7 @@ class AskProKnow():
             plan_date = ds.get("RTPlanDate")
         else:
             plan_date = ds.get("SeriesDate")
-        plan_date = datetime.strptime(plan_date, '%Y%M%d').date()
+        plan_date = datetime.strptime(plan_date, '%Y%m%d').date()
         site = ds.get("TreatmentSites")
         
         return {
