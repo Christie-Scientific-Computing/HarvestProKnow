@@ -9,10 +9,13 @@ dvhcalc.get_dvh() in api/proknow_client.py) don't have that padding, so it
 gets trimmed here before writing back -- otherwise the array length won't
 match what the rest of the pipeline produces.
 
+Defaults to a dry run -- it only prints the diff (and optionally plots it).
+Pass --write to actually update the row.
+
 Usage:
-    python fix_dvh_entry.py path/to/dvh.csv --dose-id <dose_id>
-    python fix_dvh_entry.py path/to/dvh.csv --mrn <mrn> [--structure-name PTV1_Eval-05]
-    python fix_dvh_entry.py path/to/dvh.csv --mrn <mrn> --dry-run
+    python fix_dvh_entry.py path/to/dvh.csv --dose-id <dose_id>                  # dry-run, just show the diff
+    python fix_dvh_entry.py path/to/dvh.csv --mrn <mrn> --plot                   # dry-run + visual comparison
+    python fix_dvh_entry.py path/to/dvh.csv --mrn <mrn> --write                  # actually apply the update
 """
 import argparse
 import csv
@@ -69,6 +72,37 @@ def infer_bin_width(doses: list[float]) -> float:
     return round(statistics.median(diffs), 4)
 
 
+def plot_comparison(
+    dose_csv: list[float], csv_values: list[float],
+    old_bin_width: float, old_dvh: list[float],
+    dose_id: str, structure_name: str, plot_dir: str | None,
+) -> None:
+    """Plot the CSV-derived (trimmed) DVH against the DB's current DVH."""
+    import matplotlib
+    if plot_dir:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    dose_old = [i * old_bin_width for i in range(len(old_dvh))]
+
+    fig, ax = plt.subplots()
+    ax.plot(dose_old, old_dvh, label="DB (current)", linestyle="--")
+    ax.plot(dose_csv, csv_values, label="CSV (trimmed)")
+    ax.set_xlabel("Dose (Gy)")
+    ax.set_ylabel("Relative volume (%)")
+    ax.set_title(f"{structure_name} (dose_id={dose_id})")
+    ax.legend()
+
+    if plot_dir:
+        os.makedirs(plot_dir, exist_ok=True)
+        path = os.path.join(plot_dir, f"{dose_id}_{structure_name}.png")
+        fig.savefig(path)
+        print(f"  saved plot to {path}")
+    else:
+        plt.show()
+    plt.close(fig)
+
+
 def resolve_dose_id(cursor, dose_id: str | None, mrn: str | None) -> str:
     if dose_id:
         return dose_id
@@ -92,9 +126,13 @@ def main():
     id_group.add_argument("--dose-id", help="dose_id to update directly")
     id_group.add_argument("--mrn", help="Look up the dose_id via the doses table MRN column")
     parser.add_argument("--structure-name", help="Only update this structure (must match a CSV column after stripping ' (%%)')")
-    parser.add_argument("--dry-run", action="store_true", help="Don't write to the DB, just show what would change")
-    parser.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
+    parser.add_argument("--write", action="store_true", help="Actually apply the update. Without this, the script only shows the diff (and plot, if requested)")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt (only relevant with --write)")
+    parser.add_argument("--plot", action="store_true", help="Plot the CSV-derived DVH against the DB's current DVH")
+    parser.add_argument("--plot-dir", help="Save plots as PNGs here instead of opening an interactive window (implies --plot)")
     args = parser.parse_args()
+    if args.plot_dir:
+        args.plot = True
 
     doses, structures = parse_csv(args.csv_path)
     bin_width = infer_bin_width(doses)
@@ -139,8 +177,14 @@ def main():
             print(f"  cumulative_dvh: {len(old_dvh)} bins -> {len(trimmed)} bins (dropped {len(values) - len(trimmed)} trailing zeros)")
             print(f"  volume (unchanged): {volume}")
 
-            if args.dry_run:
-                print("  [dry-run] skipping write")
+            if args.plot:
+                plot_comparison(
+                    doses[: len(trimmed)], trimmed, old_bin_width, old_dvh,
+                    dose_id, structure_name, args.plot_dir,
+                )
+
+            if not args.write:
+                print("  [dry-run] pass --write to apply this update")
                 continue
 
             if not args.yes:
