@@ -16,6 +16,7 @@ Usage:
     python fix_dvh_entry.py path/to/dvh.csv --dose-id <dose_id>                  # dry-run, just show the diff
     python fix_dvh_entry.py path/to/dvh.csv --mrn <mrn> --plot                   # dry-run + visual comparison
     python fix_dvh_entry.py path/to/dvh.csv --mrn <mrn> --write                  # actually apply the update
+    python fix_dvh_entry.py path/to/dvh.csv --mrn <mrn> --structure-name PTV1_Eval-05 --volume 123.45 --write
 """
 import argparse
 import csv
@@ -130,6 +131,7 @@ def main():
     parser.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt (only relevant with --write)")
     parser.add_argument("--plot", action="store_true", help="Plot the CSV-derived DVH against the DB's current DVH")
     parser.add_argument("--plot-dir", help="Save plots as PNGs here instead of opening an interactive window (implies --plot)")
+    parser.add_argument("--volume", type=float, help="Manually override the volume (cm^3) field for the row(s) being updated")
     args = parser.parse_args()
     if args.plot_dir:
         args.plot = True
@@ -141,6 +143,9 @@ def main():
         if args.structure_name not in structures:
             sys.exit(f"--structure-name {args.structure_name!r} not found in CSV columns: {list(structures)}")
         structures = {args.structure_name: structures[args.structure_name]}
+
+    if args.volume is not None and len(structures) > 1:
+        sys.exit("--volume applies to a single structure; pass --structure-name to disambiguate")
 
     conn = psycopg.connect(
         host=os.getenv("DB_HOST"),
@@ -170,12 +175,16 @@ def main():
                     f"No existing dvh_data row for dose_id={dose_id!r} structure_name={structure_name!r}. "
                     f"Known structures for this dose_id: {known}"
                 )
-            old_dvh, old_bin_width, volume = existing
+            old_dvh, old_bin_width, old_volume = existing
+            new_volume = args.volume if args.volume is not None else old_volume
 
             print(f"dose_id={dose_id} structure_name={structure_name!r}")
             print(f"  bin_width:      {old_bin_width} -> {bin_width}")
             print(f"  cumulative_dvh: {len(old_dvh)} bins -> {len(trimmed)} bins (dropped {len(values) - len(trimmed)} trailing zeros)")
-            print(f"  volume (unchanged): {volume}")
+            if args.volume is not None:
+                print(f"  volume:         {old_volume} -> {new_volume}")
+            else:
+                print(f"  volume (unchanged): {old_volume}")
 
             if args.plot:
                 plot_comparison(
@@ -193,10 +202,17 @@ def main():
                     print("  skipped")
                     continue
 
-            cursor.execute(
-                "UPDATE dvh_data SET cumulative_dvh = %s, bin_width = %s WHERE dose_id = %s AND structure_name = %s",
-                (trimmed, bin_width, dose_id, structure_name),
-            )
+            if args.volume is not None:
+                cursor.execute(
+                    "UPDATE dvh_data SET cumulative_dvh = %s, bin_width = %s, volume = %s "
+                    "WHERE dose_id = %s AND structure_name = %s",
+                    (trimmed, bin_width, new_volume, dose_id, structure_name),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE dvh_data SET cumulative_dvh = %s, bin_width = %s WHERE dose_id = %s AND structure_name = %s",
+                    (trimmed, bin_width, dose_id, structure_name),
+                )
             conn.commit()
             print("  updated")
     finally:
